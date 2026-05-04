@@ -65,6 +65,10 @@ Quaternion q_target;               //  目标姿态四元数
 VectorFloat gravity;        // 重力向量
 float ypr[3];               // yaw, pitch, roll（单位：弧度）
 
+float pitch = 0.0f;  //显示用
+float roll = 0.0f;   //显示用
+float yaw = 0.0f;    //显示用
+
 //陀螺仪数据
 int16_t gx_raw, gy_raw, gz_raw;
 
@@ -175,6 +179,8 @@ void setup() {
 
     calibrateGyro();  //自动校准陀螺仪零漂
 
+    pitch = 0.0f; roll = 0.0f; yaw = 0.0f; //显示用
+
 }
 
 void loop() {
@@ -226,7 +232,19 @@ void loop() {
     }
     //
     easymode_enable = (rc.SB_CMD == 0) ? true : false;   //SA开关控制是否关闭PID外环(SA=0时启用PID外环, SA=1或者SA=2时禁用PID外环)
-
+    //静态变量记录上一次的状态
+    static bool last_easymode = easymode_enable;
+    //边缘检测：如果当前状态与上一次不同，说明开关刚刚被拨动
+    if (easymode_enable != last_easymode) {
+        // 模式切换瞬间，清空所有积分项和上次误差值，防止 PID “惊跳”
+        roll_i = 0.0f;   roll_last = 0.0f;
+        pitch_i = 0.0f;  pitch_last = 0.0f;
+        yaw_i = 0.0f;    yaw_last = 0.0f;
+        // 调试打印，确认切换成功
+        Serial.println("Mode Switched: Integral Reset.");
+        // 更新旧状态记录
+        last_easymode = easymode_enable;
+    }
     
     /////////////获得四元数和陀螺仪角速度/////////////////
     if (!dmpReady) return;
@@ -236,21 +254,29 @@ void loop() {
         // 数据还不够一包，稍等
         return;
     }
+    //对齐校验.如果缓冲区内的数据不是完整包的整数倍，说明数据流已经错位
+    if (fifoCount % packetSize != 0) {
+        mpu.resetFIFO(); // 立即清空缓冲区，强制 DMP 重新开始写入对齐的包
+        Serial.println("FIFO alignment recovered."); // 调试用
+        return; 
+    }
     if (fifoCount >= 1024) {
         // FIFO 溢出，清空
         mpu.resetFIFO();
         Serial.println("FIFO overflow!");
         return;
     }
-    // 读取一个完整的 DMP 包
-    mpu.getFIFOBytes(fifoBuffer, packetSize);
-    // 从 DMP 包中解析四元数和重力向量
-    mpu.dmpGetQuaternion(&q_current, fifoBuffer);
-    mpu.dmpGetGravity(&gravity, &q_current);
-    mpu.dmpGetYawPitchRoll(ypr, &q_current, &gravity);  // ypr[0] = yaw, ypr[1] = pitch, ypr[2] = roll（单位：弧度）
-    float yaw   = rad2deg(ypr[0]);
-    float pitch = rad2deg(ypr[1]);
-    float roll  = rad2deg(ypr[2]);
+    if (fifoCount > 0) {
+        // 读取一个完整的 DMP 包
+        mpu.getFIFOBytes(fifoBuffer, packetSize);
+        // 从 DMP 包中解析四元数和重力向量
+        mpu.dmpGetQuaternion(&q_current, fifoBuffer);
+        mpu.dmpGetGravity(&gravity, &q_current);
+        mpu.dmpGetYawPitchRoll(ypr, &q_current, &gravity);  // ypr[0] = yaw, ypr[1] = pitch, ypr[2] = roll（单位：弧度）
+        yaw   = rad2deg(ypr[0]);
+        pitch = rad2deg(ypr[1]);
+        roll  = rad2deg(ypr[2]);
+    }
 
     //获取陀螺仪数据
     mpu.getRotation(&gx_raw, &gy_raw, &gz_raw);
@@ -272,13 +298,20 @@ void loop() {
     //yaw 是累积角度（航向锁定）
     static float yaw_target = 0.0f;
     yaw_target -= rc.yaw_CMD * 0.02f;   // 每次循环累积一点
+
+    //修正:约束在 -PI 到 PI 之间，确保四元数生成的稳定性
+    if (yaw_target > M_PI)  yaw_target -= 2.0f * M_PI;
+    if (yaw_target < -M_PI) yaw_target += 2.0f * M_PI;
+
+
     //摇杆输入转目标四元数(欧拉角 → 四元数)
     q_target = eulerToQuaternion(roll_target, pitch_target, yaw_target);
 
     ///////////进行PID计算得到姿态控制输出////////////////////////
     float err_pitch_rate, err_roll_rate, err_yaw_rate, u_roll, u_pitch, u_yaw;
     //得到姿态控制输出u_roll, u_pitch, u_yaw, 这三个值似乎是机体坐标系
-    attitudeControlStep(q_target, q_current, gx, gy, gz, dt, err_pitch_rate, err_roll_rate, err_yaw_rate, u_roll, u_pitch, u_yaw);   
+    attitudeControlStep(q_target, q_current, gx, gy, gz, dt, err_pitch_rate, err_roll_rate, err_yaw_rate, u_roll, u_pitch, u_yaw);  
+
 
     //固定翼不需要电机混控motorMix
 
@@ -293,8 +326,10 @@ void loop() {
     static uint32_t lastTick = 0;
     if (millis() - lastTick > 50) {
 
-        Serial.printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-                    pitch, roll, yaw, gx, gy, gz, err_pitch_rate, err_roll_rate, err_yaw_rate, u_pitch, u_roll, u_yaw, Kp_gain);
+        //Serial.printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+        //            pitch, roll, yaw, gx, gy, gz, err_pitch_rate, err_roll_rate, err_yaw_rate, u_pitch, u_roll, u_yaw, Kp_gain);
+        Serial.printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+                    q_current.w, q_current.x, q_current.y, q_current.z, gx, gy, gz, err_pitch_rate, err_roll_rate, err_yaw_rate, u_pitch, u_roll, u_yaw, Kp_gain);
 
         lastTick = millis();
     }
@@ -317,9 +352,22 @@ void attitudeControlStep(
     float dt,
     float& err_pitch_rate, float& err_roll_rate, float& err_yaw_rate,
     float& u_roll, float& u_pitch, float& u_yaw)
-{
+{   
+    
     // 1. 四元数姿态误差
-    Quaternion q_err = q_target.getProduct(q_current.getConjugate());
+    //之前的写法：计算的是地理坐标系下的误差
+    //Quaternion q_err = q_target.getProduct(q_current.getConjugate());
+    //新的写法,将姿态误差转换到**机体坐标系（Body Frame）**中, 这样无论飞机转到哪个方向，PID 始终只根据机体自身的轴向来修正。
+    Quaternion q_err = q_current.getConjugate().getProduct(q_target);
+
+    //确保误差永远取最短路径
+    // 如果 w < 0，说明旋转超过了 180 度，我们取其相反数
+    if (q_err.w < 0) {
+        q_err.w = -q_err.w;
+        q_err.x = -q_err.x;
+        q_err.y = -q_err.y;
+        q_err.z = -q_err.z;
+    }
 
     // 2. 姿态误差向量（目标角速度）
     float ex = 2.0f * q_err.x;  //sin(θ/2) 最大是 1，所以 ex 理论最大可以到 2. 
@@ -334,9 +382,9 @@ void attitudeControlStep(
     // 3. 角速度误差
     if (easymode_enable){
         //PID外环启用
-        err_roll_rate  = ex * 7.0f - gx;   //ex的范围在[-2.0, 2.0]之间,要给 ex 乘以一个比例系数。
-        err_pitch_rate = ey * 7.0f - gy;
-        err_yaw_rate   = ez * 7.0f - gz;
+        err_roll_rate  = ex * 10.0f - gx;   //ex的范围在[-2.0, 2.0]之间,要给 ex 乘以一个比例系数。
+        err_pitch_rate = ey * 10.0f - gy;
+        err_yaw_rate   = ez * 10.0f - gz;
     }else
     {
         //禁用外环的情况下,角速度误差直接使用摇杆输入
@@ -359,12 +407,12 @@ void attitudeControlStep(
 
     u_yaw = pid_update(err_yaw_rate, dt,
                        yaw_i, yaw_last,
-                       Kp_gain * 10.0f, 0.0f, 0.00f,  //kp,ki,kd
+                       Kp_gain * 10.0f, 0.0f, 0.01f,  //kp,ki,kd
                        -300.0f, 300.0f);
 }
 
 //pid算法
-float pid_update(float err, float dt,
+float pid_update_old(float err, float dt,
                  float &i_term, float &last_err,
                  float kp, float ki, float kd,
                  float out_min, float out_max)
@@ -378,6 +426,39 @@ float pid_update(float err, float dt,
 
     // 微分
     float d = (err - last_err) / dt;
+    last_err = err;
+
+    // PID 输出
+    float out = kp * err + ki * i_term + kd * d;
+
+    // 输出限幅
+    if (out > out_max) out = out_max;
+    if (out < out_min) out = out_min;
+
+    return out;
+}
+
+float pid_update(float err, float dt,
+                 float &i_term, float &last_err,
+                 float kp, float ki, float kd,
+                 float out_min, float out_max)
+{
+    // 积分
+    i_term += err * dt;
+    // 抗积分饱和
+    if (i_term > out_max/4.0f) i_term = out_max/4.0f;
+    if (i_term < out_min/4.0f) i_term = out_min/4.0f;
+
+    // --- 核心修正：处理最短路径导致的微分跳变 ---
+    float delta_err = err - last_err;
+    
+    // 如果误差变化量极大（超过了物理上可能的转速），说明发生了正负号翻转
+    // 我们强制让 delta_err 趋于 0，避免 D 项爆炸
+    if (delta_err > 3.0f)  delta_err -= 4.0f; 
+    if (delta_err < -3.0f) delta_err += 4.0f;
+
+    // 微分计算使用修正后的 delta_err
+    float d = delta_err / dt;
     last_err = err;
 
     // PID 输出
