@@ -295,11 +295,6 @@ void loop() {
         yaw_i = 0.0f;    yaw_last = 0.0f;
         // 调试打印，确认切换成功
         Serial.println("Mode Switched: Integral Reset.");        
-        
-        if(flymode == 2){
-            //q_target = q_current;
-            //yaw_target = ypr[0]; //切换模式时防止跳变
-        }
         // 更新旧状态记录
         last_flymode = flymode;
         
@@ -327,9 +322,9 @@ void loop() {
         //yaw_target = current_yaw; //这句其实没用,后面q_target = q_current;
     } 
     
-    //修正:约束在 -PI 到 PI 之间，确保四元数生成的稳定性
-    if (yaw_target > M_PI)  yaw_target -= 2.0f * M_PI;
-    if (yaw_target < -M_PI) yaw_target += 2.0f * M_PI;
+    //不再需要
+    //if (yaw_target > M_PI)  yaw_target -= 2.0f * M_PI;
+    //if (yaw_target < -M_PI) yaw_target += 2.0f * M_PI;
 
     //输入转目标四元数(欧拉角 → 四元数)
     if(flymode == 2 || flymode == 1){
