@@ -6,6 +6,8 @@
 #include <WiFi.h>
 #include <esp_bt.h>
 
+
+//按照MPU6050上印刷的坐标轴, X向前, Y向左,Z向上, 根据右手方向: 右滚为正, 低头为正,左转为正.
 // ---------------------------
 // 遥控信号接收部分定义
 //定义第二串口引脚
@@ -57,7 +59,7 @@ uint16_t packetSize;        // 每个 DMP 包的字节数
 uint16_t fifoCount;         // FIFO 当前字节数
 uint8_t fifoBuffer[64];     // FIFO 缓冲区
 
-bool easymode_enable = true;   //默认开启PID外环
+int flymode = 2;   //默认easy模式
 
 // 姿态相关（四元数 + YPR）
 Quaternion q_current;               // 当前姿态四元数
@@ -83,6 +85,8 @@ float Kp_gain = 1.0f;
 //最大姿态角（可调）45度
 float max_roll  = 45.0f * 0.0174533f;   //转换为 rad
 float max_pitch = 45.0f * 0.0174533f;   //转换为 rad
+
+float global_yaw_target = 0.0f;
 
 
 ////////////////////////////////////////////////////
@@ -152,15 +156,16 @@ void setup() {
     Serial.println("Initializing DMP...");
     devStatus = mpu.dmpInitialize();
 
-    // 根据你的实际安装方向做轴/方向校准（这里先用默认值）
-    // mpu.setXAccelOffset(...);
-    // mpu.setYAccelOffset(...);
-    // mpu.setZAccelOffset(...);
-    // mpu.setXGyroOffset(...);
-    // mpu.setYGyroOffset(...);
-    // mpu.setZGyroOffset(...);
+    //mpu.setXAccelOffset(0); mpu.setYAccelOffset(0); mpu.setZAccelOffset(0);
+    //mpu.setXGyroOffset(0);  mpu.setYGyroOffset(0);  mpu.setZGyroOffset(0);
 
     if (devStatus == 0) {
+
+        Serial.println("Self-calibrating...");
+        //mpu.CalibrateAccel(6); // 自动迭代 6 次校准加速度计
+        //mpu.CalibrateGyro(6);  // 自动迭代 6 次校准陀螺仪
+        calibrateGyro();
+       
         // 开启 DMP
         mpu.setDMPEnabled(true);
         // 获取中断状态
@@ -176,8 +181,6 @@ void setup() {
     }
 
     delay(1000);
-
-    calibrateGyro();  //自动校准陀螺仪零漂
 
     pitch = 0.0f; roll = 0.0f; yaw = 0.0f; //显示用
 
@@ -208,6 +211,8 @@ void loop() {
     rc.SD_CMD = mapSwitch(crsf.getChannel(8), 2);  //2档
     rc.SE_CMD = mapSwitch(crsf.getChannel(9), 2);  //2档
     rc.S1_CMD = mapValue(crsf.getChannel(10), 1000, 2000, -1, 1);  //拨轮
+
+    flymode = rc.SB_CMD;   //飞行模式由SB档位控制, 0,1,2分别对应不同的飞行模式, 0代表stable模式/只做角速度pid稳定, 1代表angle模式/做pitch和roll的姿态角度串级pid控制, 2代表easy模式/实现pitch,roll,yaw的协同转弯控制, 但目前还没有实现.
     Kp_gain = mapKnobToKp_linear(rc.S1_CMD);   //将拨轮S1的输入(-1,0,1)映射到(0.1,1.0,10)
 
     // 当无法获得无线电信号时，将所有指令置为0
@@ -222,6 +227,8 @@ void loop() {
         rc.SD_CMD = 0;
         rc.SE_CMD = 0;
         rc.S1_CMD = 0.0f;
+        flymode = 1;   //失去信号时切换到安全模式, 也可以选择其他模式, 例如直接断电或保持最后的指令不变等.
+        Kp_gain = 1.0f;
     }
     // 当有无线电信号时，如果rc.SA_CMD为0，则摇杆指令置为0
     if (crsf.isLinkUp() && rc.SA_CMD == 0) {
@@ -229,21 +236,6 @@ void loop() {
         rc.pitch_CMD = 0.0f;
         rc.thr_CMD = 1000.0f;
         rc.yaw_CMD = 0.0f;
-    }
-    //
-    easymode_enable = (rc.SB_CMD == 0) ? true : false;   //SA开关控制是否关闭PID外环(SA=0时启用PID外环, SA=1或者SA=2时禁用PID外环)
-    //静态变量记录上一次的状态
-    static bool last_easymode = easymode_enable;
-    //边缘检测：如果当前状态与上一次不同，说明开关刚刚被拨动
-    if (easymode_enable != last_easymode) {
-        // 模式切换瞬间，清空所有积分项和上次误差值，防止 PID “惊跳”
-        roll_i = 0.0f;   roll_last = 0.0f;
-        pitch_i = 0.0f;  pitch_last = 0.0f;
-        yaw_i = 0.0f;    yaw_last = 0.0f;
-        // 调试打印，确认切换成功
-        Serial.println("Mode Switched: Integral Reset.");
-        // 更新旧状态记录
-        last_easymode = easymode_enable;
     }
     
     /////////////获得四元数和陀螺仪角速度/////////////////
@@ -290,37 +282,83 @@ void loop() {
     gz *= 0.0174533f;
     //gx += 0.02f;       /////////校准后还是总偏-0.02
 
+    float roll_target, pitch_target;
+
+    static bool switch_to_2 = false;
+    //静态变量记录上一次的状态
+    static int last_flymode = flymode;
+    //边缘检测：如果当前状态与上一次不同，说明开关刚刚被拨动
+    if (flymode != last_flymode) {
+        // 模式切换瞬间，清空所有积分项和上次误差值，防止 PID “惊跳”
+        roll_i = 0.0f;   roll_last = 0.0f;
+        pitch_i = 0.0f;  pitch_last = 0.0f;
+        yaw_i = 0.0f;    yaw_last = 0.0f;
+        // 调试打印，确认切换成功
+        Serial.println("Mode Switched: Integral Reset.");        
+        
+        if(flymode == 2){
+            syncYawTargetFromCurrent(); // 强制让目标 Yaw 等于当前物理 Yaw
+            //q_target = q_current;
+            //global_yaw_target = ypr[0]; //切换模式时防止跳变
+            switch_to_2 = true;
+        }
+        // 更新旧状态记录
+        last_flymode = flymode;
+        
+    }
+
     ///////////根据摇杆输入构造q_target///////////////////////////
-    //摇杆输入转四元数
-    //roll/pitch 目标角度
-    float roll_target  = rc.roll_CMD  * max_roll;   //摇杆输入（-1.0 ~ +1.0）转为rad角度. 摇杆向前推为正,这和坐标系规定相反,乘-1.
-    float pitch_target = rc.pitch_CMD * max_pitch;  //摇杆输入（-1.0 ~ +1.0）转为rad角度
-    //yaw 是累积角度（航向锁定）
-    static float yaw_target = 0.0f;
-    yaw_target -= rc.yaw_CMD * 0.02f;   // 每次循环累积一点
 
+    roll_target  = rc.roll_CMD  * max_roll;   //摇杆输入（-1.0 ~ +1.0）转为rad角度.
+    pitch_target = rc.pitch_CMD * max_pitch;  //摇杆输入（-1.0 ~ +1.0）转为rad角度
+    if(flymode == 2){
+        global_yaw_target = global_yaw_target - rc.yaw_CMD * 0.01f;   // 每次循环累积一点;//动态更新航向锁定点：航向随转向摇杆漂移
+    }else if(flymode == 1){
+        global_yaw_target = -ypr[0]; //让目标yaw始终跟随当前yaw. q_err是构造外环误差的, 而遥控器输入在内环.
+    }else if(flymode == 0){
+        global_yaw_target = -ypr[0]; //这句其实没用,后面q_target = q_current;
+    }
+        
     //修正:约束在 -PI 到 PI 之间，确保四元数生成的稳定性
-    if (yaw_target > M_PI)  yaw_target -= 2.0f * M_PI;
-    if (yaw_target < -M_PI) yaw_target += 2.0f * M_PI;
+    if (global_yaw_target > M_PI)  global_yaw_target -= 2.0f * M_PI;
+    if (global_yaw_target < -M_PI) global_yaw_target += 2.0f * M_PI;
 
-
-    //摇杆输入转目标四元数(欧拉角 → 四元数)
-    q_target = eulerToQuaternion(roll_target, pitch_target, yaw_target);
+    //输入转目标四元数(欧拉角 → 四元数)
+    if(flymode == 2 || flymode == 1){
+        if(switch_to_2 == false){
+            q_target = eulerToQuaternion(roll_target, pitch_target, global_yaw_target);
+        }else{
+            switch_to_2 = false;
+        }
+    }else{
+        q_target = q_current;
+    }
 
     ///////////进行PID计算得到姿态控制输出////////////////////////
     float err_pitch_rate, err_roll_rate, err_yaw_rate, u_roll, u_pitch, u_yaw;
     //得到姿态控制输出u_roll, u_pitch, u_yaw, 这三个值似乎是机体坐标系
-    attitudeControlStep(q_target, q_current, gx, gy, gz, dt, err_pitch_rate, err_roll_rate, err_yaw_rate, u_roll, u_pitch, u_yaw);  
+    attitudeControlStep(q_target, q_current, gx, gy, gz, dt, err_pitch_rate, err_roll_rate, err_yaw_rate, u_roll, u_pitch, u_yaw);  // 传入目标四元数、当前四元数、角速度、时间间隔、误差、控制输出
 
+    float final_u_roll  = u_roll;
+    float final_u_pitch = u_pitch;
+    float final_u_yaw   = u_yaw;
 
-    //固定翼不需要电机混控motorMix
+    if (flymode == 2) {
+        // --- 协同逻辑 A: 偏航带横滚. 当你打 Yaw 摇杆时，直接给 Roll 输出加一个补偿量
+        //final_u_roll = final_u_roll + rc.yaw_CMD * 50.0f;
+        final_u_roll = 0.5f * u_roll - 0.5f * u_yaw;    // 假设 rc.yaw_CMD 左打为正，左滚为负，则用减号
+
+        // --- 协同逻辑 B: 横滚带俯仰 (自动抬头) : 只要有横滚角（无论左倾右倾），就给俯仰输出加一个“抬头”量
+        float pitch_comp = (1.0f - cosf(ypr[2])) * 80.0f;
+        final_u_pitch = u_pitch - pitch_comp; // 减法代表抬头.
+    }
 
     //输出硬件LEDC PWM
     ledcWrite(LEDC_Throttle_PIN, mapToLedc(rc.thr_CMD, 1000, 2000, LEDC_FREQ_400, 1000, 2000)); 
-    ledcWrite(LEDC_Roll1_PIN,    mapToLedc(u_roll,  -300, 300, LEDC_FREQ_50, 500, 2500));
-    ledcWrite(LEDC_Roll2_PIN,    mapToLedc(u_roll,  -300, 300, LEDC_FREQ_50, 500, 2500));
-    ledcWrite(LEDC_Pitch_PIN,    mapToLedc(u_pitch, -300, 300, LEDC_FREQ_50, 500, 2500));
-    ledcWrite(LEDC_Yaw_PIN,      mapToLedc(u_yaw,   -300, 300, LEDC_FREQ_50, 500, 2500));
+    ledcWrite(LEDC_Roll1_PIN,    mapToLedc(final_u_roll,  -300, 300, LEDC_FREQ_50, 500, 2500));
+    ledcWrite(LEDC_Roll2_PIN,    mapToLedc(final_u_roll,  -300, 300, LEDC_FREQ_50, 500, 2500));
+    ledcWrite(LEDC_Pitch_PIN,    mapToLedc(final_u_pitch, -300, 300, LEDC_FREQ_50, 500, 2500));
+    ledcWrite(LEDC_Yaw_PIN,      mapToLedc(final_u_yaw,   -300, 300, LEDC_FREQ_50, 500, 2500));
 
     //打印部分, 定期执行
     static uint32_t lastTick = 0;
@@ -328,8 +366,8 @@ void loop() {
 
         //Serial.printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
         //            pitch, roll, yaw, gx, gy, gz, err_pitch_rate, err_roll_rate, err_yaw_rate, u_pitch, u_roll, u_yaw, Kp_gain);
-        Serial.printf("%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
-                    q_current.w, q_current.x, q_current.y, q_current.z, gx, gy, gz, err_pitch_rate, err_roll_rate, err_yaw_rate, u_pitch, u_roll, u_yaw, Kp_gain);
+        Serial.printf("%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f,%.4f\n",
+            q_target.w, q_target.x, q_target.y, q_target.z, q_current.w, q_current.x, q_current.y, q_current.z, gx, gy, gz, err_pitch_rate, err_roll_rate, err_yaw_rate, final_u_pitch, final_u_roll, final_u_yaw, Kp_gain);
 
         lastTick = millis();
     }
@@ -338,9 +376,15 @@ void loop() {
     //Serial.print("\n");
 }
 
-////////////////////////////////////////////////////
-//////////////////FUNCTION//////////////////////////
-////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+//////////////////FUNCTION////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////
 // ---------------------------
 
 
@@ -355,10 +399,9 @@ void attitudeControlStep(
 {   
     
     // 1. 四元数姿态误差
-    //之前的写法：计算的是地理坐标系下的误差
+    //
     //Quaternion q_err = q_target.getProduct(q_current.getConjugate());
-    //新的写法,将姿态误差转换到**机体坐标系（Body Frame）**中, 这样无论飞机转到哪个方向，PID 始终只根据机体自身的轴向来修正。
-    Quaternion q_err = q_current.getConjugate().getProduct(q_target);
+    Quaternion q_err = q_current.getConjugate().getProduct(q_target);   //使用这一句的话, 在flymode=1时, 会出现偏航时方向不对的问题.
 
     //确保误差永远取最短路径
     // 如果 w < 0，说明旋转超过了 180 度，我们取其相反数
@@ -380,17 +423,27 @@ void attitudeControlStep(
 
 
     // 3. 角速度误差
-    if (easymode_enable){
+    if (flymode == 2)   //easy模式启用协同转弯控制
+    {
+        //对于此模式,输入的q_target已经在函数外调整了
         //PID外环启用
+        err_roll_rate  = ex * 10.0f - gx;
+        err_pitch_rate = ey * 10.0f - gy;
+        err_yaw_rate   = ez * 10.0f - gz;     //锁航向的话, 切换模式时有跳变, 目前无法解决.
+
+    }else if (flymode == 1)   //easy和stable模式启用外环PID
+    {   //对于ROll和PITCH, PID外环启用; YAW不启用外环
         err_roll_rate  = ex * 10.0f - gx;   //ex的范围在[-2.0, 2.0]之间,要给 ex 乘以一个比例系数。
         err_pitch_rate = ey * 10.0f - gy;
-        err_yaw_rate   = ez * 10.0f - gz;
-    }else
+        err_yaw_rate   = -rc.yaw_CMD * 10.0f - gz;  //这里的外环控制目标是roll/pitch的角度，但yaw的外环控制目标是航向锁定（yaw_target），在当前的模式下不能进行航向锁定(否则只能使用yaw转弯),所以只用内环.
+
+    }else if (flymode == 0)   //stable模式禁用外环
     {
         //禁用外环的情况下,角速度误差直接使用摇杆输入
-        err_roll_rate  = rc.roll_CMD  * 10.0f  - gx;      // 实际飞行中通常在 0-10 rad/s波动，极限可达±35rad/s
-        err_pitch_rate = rc.pitch_CMD * 10.0f  - gy;
-        err_yaw_rate   = rc.yaw_CMD   * 10.0f  - gz;
+        err_roll_rate  = rc.roll_CMD  * 10.0f - gx;      // 实际飞行中通常在 0-10 rad/s波动，极限可达±35rad/s
+        err_pitch_rate = rc.pitch_CMD * 10.0f - gy;
+        err_yaw_rate   = -rc.yaw_CMD   * 10.0f - gz;
+
     }
     //Serial.printf("%.4f,%.1f,%.1f\n",err_roll_rate, err_pitch_rate, err_yaw_rate);
     
@@ -411,32 +464,7 @@ void attitudeControlStep(
                        -300.0f, 300.0f);
 }
 
-//pid算法
-float pid_update_old(float err, float dt,
-                 float &i_term, float &last_err,
-                 float kp, float ki, float kd,
-                 float out_min, float out_max)
-{
-    // 积分
-    i_term += err * dt;
 
-    // 抗积分饱和
-    if (i_term > out_max/4.0f) i_term = out_max/4.0f;     //积分限幅为pid输出限幅的1/4
-    if (i_term < out_min/4.0f) i_term = out_min/4.0f;
-
-    // 微分
-    float d = (err - last_err) / dt;
-    last_err = err;
-
-    // PID 输出
-    float out = kp * err + ki * i_term + kd * d;
-
-    // 输出限幅
-    if (out > out_max) out = out_max;
-    if (out < out_min) out = out_min;
-
-    return out;
-}
 
 float pid_update(float err, float dt,
                  float &i_term, float &last_err,
@@ -472,40 +500,6 @@ float pid_update(float err, float dt,
 }
 
 
-
-//陀螺仪自动校准代码
-void calibrateGyro() {
-    int32_t gx_sum = 0, gy_sum = 0, gz_sum = 0;
-    int16_t gx, gy, gz;
-
-    Serial.println("Calibrating gyro... Keep the device absolutely still!");
-
-    // 采样次数
-    const int samples = 2000;
-
-    for (int i = 0; i < samples; i++) {
-        mpu.getRotation(&gx, &gy, &gz);
-        gx_sum += gx;
-        gy_sum += gy;
-        gz_sum += gz;
-        delay(2);  // 500 Hz 采样
-    }
-
-    int16_t gx_offset = -(gx_sum / samples);
-    int16_t gy_offset = -(gy_sum / samples);
-    int16_t gz_offset = -(gz_sum / samples);
-
-    // 写入 offset
-    mpu.setXGyroOffset(gx_offset);
-    mpu.setYGyroOffset(gy_offset);
-    mpu.setZGyroOffset(gz_offset);
-
-    Serial.println("Gyro calibration done!");
-    Serial.print("Offsets: ");
-    Serial.print(gx_offset); Serial.print(", ");
-    Serial.print(gy_offset); Serial.print(", ");
-    Serial.println(gz_offset);
-}
 
 
 //欧拉角 → 四元数函数
@@ -634,3 +628,138 @@ uint32_t mapToLedc(float IN, float a, float b, uint32_t LEDC_FREQ, float x, floa
 
     return OUT;
 }
+
+
+// 完整的传感器校准：包含陀螺仪和加速度计
+void calibrateSensors() {
+    int32_t ax_sum = 0, ay_sum = 0, az_sum = 0;
+    int32_t gx_sum = 0, gy_sum = 0, gz_sum = 0;
+    int16_t ax, ay, az, gx, gy, gz;
+
+    Serial.println("Calibrating... Ensure device is level and STILL.");
+
+    const int samples = 1000; 
+    for (int i = 0; i < samples; i++) {
+        mpu.getMotion6(&ax, &ay, &az, &gx, &gy, &gz);
+        ax_sum += ax; ay_sum += ay; az_sum += az;
+        gx_sum += gx; gy_sum += gy; gz_sum += gz;
+        delay(2);
+    }
+
+    // --- 核心修正点 ---
+    // 硬件 Offset = 寄存器当前值 + (目标值 - 测量均值)
+    // 假设当前寄存器 Offset 为 0，则：
+    int16_t ax_off = - (ax_sum / samples);
+    int16_t ay_off = - (ay_sum / samples);
+    int16_t az_off = (8192 - (az_sum / samples)); // 修正为：目标(8192) - 测量值
+
+    // 陀螺仪目标均为 0
+    int16_t gx_off = - (gx_sum / samples);
+    int16_t gy_off = - (gy_sum / samples);
+    int16_t gz_off = - (gz_sum / samples);
+
+    mpu.setXAccelOffset(ax_off);
+    mpu.setYAccelOffset(ay_off);
+    mpu.setZAccelOffset(az_off);
+    mpu.setXGyroOffset(gx_off);
+    mpu.setYGyroOffset(gy_off);
+    mpu.setZGyroOffset(gz_off);
+
+    Serial.println("Calibration Done.");
+    //注意:关于 8192 精度：你的代码中设置了 mpu.setFullScaleAccelRange(MPU6050_ACCEL_FS_4)。在 ±4g 量程下，1g 对应的数字量是 8192。如果你之后改为 ±2g，这个数字需要改为 16384。
+}
+
+
+
+//陀螺仪自动校准代码
+void calibrateGyro() {
+    int32_t gx_sum = 0, gy_sum = 0, gz_sum = 0;
+    int16_t gx, gy, gz;
+
+    Serial.println("Calibrating gyro... Keep the device absolutely still!");
+
+    // 采样次数
+    const int samples = 2000;
+
+    for (int i = 0; i < samples; i++) {
+        mpu.getRotation(&gx, &gy, &gz);
+        gx_sum += gx;
+        gy_sum += gy;
+        gz_sum += gz;
+        delay(2);  // 500 Hz 采样
+    }
+
+    int16_t gx_offset = -(gx_sum / samples);
+    int16_t gy_offset = -(gy_sum / samples);
+    int16_t gz_offset = -(gz_sum / samples);
+
+    // 写入 offset
+    mpu.setXGyroOffset(gx_offset);
+    mpu.setYGyroOffset(gy_offset);
+    mpu.setZGyroOffset(gz_offset);
+
+    Serial.println("Gyro calibration done!");
+    Serial.print("Offsets: ");
+    Serial.print(gx_offset); Serial.print(", ");
+    Serial.print(gy_offset); Serial.print(", ");
+    Serial.println(gz_offset);
+}
+
+
+void syncYawTargetFromCurrent() {
+    // 1. 提取 Twist 分量 (绕 Z 轴旋转)
+    // q_current 是 DMP 输出的当前姿态
+    float w = q_current.w;
+    float z = q_current.z;
+
+    // 2. 归一化。因为去掉了 x 和 y 分量，必须重新归一化以保持四元数的有效性
+    float mag = sqrt(w * w + z * z);
+    
+    if (mag > 0) {
+        // 得到纯净的 Yaw 四元数
+        float q_yaw_w = w / mag;
+        float q_yaw_z = z / mag;
+
+        // 3. 计算对应的角度 (global_yaw_target)
+        // 四元数 w = cos(theta/2), z = sin(theta/2)
+        // 使用 atan2 提取 theta
+        global_yaw_target = atan2(q_yaw_z, q_yaw_w) * 2.0f;
+        
+        // 保持在 -PI 到 PI 之间
+        if (global_yaw_target > PI) global_yaw_target -= 2.0f * PI;
+        if (global_yaw_target < -PI) global_yaw_target += 2.0f * PI;
+        
+        // 4. 更新目标四元数，此时目标四元数与当前 Yaw 完全对齐，误差为 0
+        q_target = eulerToQuaternion(0, 0, global_yaw_target);
+    }
+}
+
+/*
+
+//pid算法
+float pid_update_old(float err, float dt,
+                 float &i_term, float &last_err,
+                 float kp, float ki, float kd,
+                 float out_min, float out_max)
+{
+    // 积分
+    i_term += err * dt;
+
+    // 抗积分饱和
+    if (i_term > out_max/4.0f) i_term = out_max/4.0f;     //积分限幅为pid输出限幅的1/4
+    if (i_term < out_min/4.0f) i_term = out_min/4.0f;
+
+    // 微分
+    float d = (err - last_err) / dt;
+    last_err = err;
+
+    // PID 输出
+    float out = kp * err + ki * i_term + kd * d;
+
+    // 输出限幅
+    if (out > out_max) out = out_max;
+    if (out < out_min) out = out_min;
+
+    return out;
+}
+    */
