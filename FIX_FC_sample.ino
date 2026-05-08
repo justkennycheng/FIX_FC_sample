@@ -284,7 +284,6 @@ void loop() {
 
     float roll_target, pitch_target;
 
-    static bool switch_to_2 = false;
     //静态变量记录上一次的状态
     static int last_flymode = flymode;
     //边缘检测：如果当前状态与上一次不同，说明开关刚刚被拨动
@@ -300,7 +299,6 @@ void loop() {
             syncYawTargetFromCurrent(); // 强制让目标 Yaw 等于当前物理 Yaw
             //q_target = q_current;
             //global_yaw_target = ypr[0]; //切换模式时防止跳变
-            switch_to_2 = true;
         }
         // 更新旧状态记录
         last_flymode = flymode;
@@ -313,23 +311,22 @@ void loop() {
     pitch_target = rc.pitch_CMD * max_pitch;  //摇杆输入（-1.0 ~ +1.0）转为rad角度
     if(flymode == 2){
         global_yaw_target = global_yaw_target - rc.yaw_CMD * 0.01f;   // 每次循环累积一点;//动态更新航向锁定点：航向随转向摇杆漂移
-    }else if(flymode == 1){
-        global_yaw_target = -ypr[0]; //让目标yaw始终跟随当前yaw. q_err是构造外环误差的, 而遥控器输入在内环.
-    }else if(flymode == 0){
-        global_yaw_target = -ypr[0]; //这句其实没用,后面q_target = q_current;
     }
-        
+    if(flymode == 1){
+        global_yaw_target = -ypr[0]; //让目标yaw始终跟随当前yaw. q_err是构造外环误差的, 而遥控器输入在内环.
+    }
+    if(flymode == 0){
+        global_yaw_target = -ypr[0]; //这句其实没用,后面q_target = q_current;
+    } 
+    
     //修正:约束在 -PI 到 PI 之间，确保四元数生成的稳定性
     if (global_yaw_target > M_PI)  global_yaw_target -= 2.0f * M_PI;
     if (global_yaw_target < -M_PI) global_yaw_target += 2.0f * M_PI;
 
     //输入转目标四元数(欧拉角 → 四元数)
     if(flymode == 2 || flymode == 1){
-        if(switch_to_2 == false){
-            q_target = eulerToQuaternion(roll_target, pitch_target, global_yaw_target);
-        }else{
-            switch_to_2 = false;
-        }
+        q_target = eulerToQuaternion(roll_target, pitch_target, global_yaw_target);
+
     }else{
         q_target = q_current;
     }
@@ -401,7 +398,7 @@ void attitudeControlStep(
     // 1. 四元数姿态误差
     //
     //Quaternion q_err = q_target.getProduct(q_current.getConjugate());
-    Quaternion q_err = q_current.getConjugate().getProduct(q_target);   //使用这一句的话, 在flymode=1时, 会出现偏航时方向不对的问题.
+    Quaternion q_err = q_current.getConjugate().getProduct(q_target);   //
 
     //确保误差永远取最短路径
     // 如果 w < 0，说明旋转超过了 180 度，我们取其相反数
