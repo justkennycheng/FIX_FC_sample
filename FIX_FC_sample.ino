@@ -296,7 +296,6 @@ void loop() {
         Serial.println("Mode Switched: Integral Reset.");        
         
         if(flymode == 2){
-            syncYawTargetFromCurrent(); // 强制让目标 Yaw 等于当前物理 Yaw
             //q_target = q_current;
             //global_yaw_target = ypr[0]; //切换模式时防止跳变
         }
@@ -703,33 +702,6 @@ void calibrateGyro() {
 }
 
 
-void syncYawTargetFromCurrent() {
-    // 1. 提取 Twist 分量 (绕 Z 轴旋转)
-    // q_current 是 DMP 输出的当前姿态
-    float w = q_current.w;
-    float z = q_current.z;
-
-    // 2. 归一化。因为去掉了 x 和 y 分量，必须重新归一化以保持四元数的有效性
-    float mag = sqrt(w * w + z * z);
-    
-    if (mag > 0) {
-        // 得到纯净的 Yaw 四元数
-        float q_yaw_w = w / mag;
-        float q_yaw_z = z / mag;
-
-        // 3. 计算对应的角度 (global_yaw_target)
-        // 四元数 w = cos(theta/2), z = sin(theta/2)
-        // 使用 atan2 提取 theta
-        global_yaw_target = atan2(q_yaw_z, q_yaw_w) * 2.0f;
-        
-        // 保持在 -PI 到 PI 之间
-        if (global_yaw_target > PI) global_yaw_target -= 2.0f * PI;
-        if (global_yaw_target < -PI) global_yaw_target += 2.0f * PI;
-        
-        // 4. 更新目标四元数，此时目标四元数与当前 Yaw 完全对齐，误差为 0
-        q_target = eulerToQuaternion(0, 0, global_yaw_target);
-    }
-}
 
 /*
 
