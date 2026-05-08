@@ -89,7 +89,7 @@ float max_pitch = 45.0f * 0.0174533f;   //转换为 rad
 float roll_target, pitch_target;
 float yaw_target;
 
-float current_yaw; Quaternion current_q_tilt; 
+float current_yaw; float current_roll; Quaternion current_q_tilt; 
 Quaternion target_q_tile, target_q_yaw;
 
 ////////////////////////////////////////////////////
@@ -305,6 +305,10 @@ void loop() {
         2.0f * (q_current.w * q_current.z + q_current.x * q_current.y),
         1.0f - 2.0f * (q_current.y * q_current.y + q_current.z * q_current.z)
     );  //当前航向角（单位：弧度）
+    current_roll = atan2f(
+        2.0f * (q_current.w * q_current.x + q_current.y * q_current.z),
+        1.0f - 2.0f * (q_current.x * q_current.x + q_current.y * q_current.y)
+    );
     current_q_tilt = removeYaw(q_current);
 
     ///////////根据摇杆输入构造q_target///////////////////////////
@@ -340,7 +344,7 @@ void loop() {
 
     ///////////进行PID计算得到姿态控制输出////////////////////////
     float err_pitch_rate, err_roll_rate, err_yaw_rate, u_roll, u_pitch, u_yaw;
-    //得到姿态控制输出u_roll, u_pitch, u_yaw, 这三个值似乎是机体坐标系
+    //得到姿态控制输出u_roll, u_pitch, u_yaw
     attitudeControlStep(q_target, q_current, gx, gy, gz, dt, err_pitch_rate, err_roll_rate, err_yaw_rate, u_roll, u_pitch, u_yaw);  // 传入目标四元数、当前四元数、角速度、时间间隔、误差、控制输出
 
     float final_u_roll  = u_roll;
@@ -353,7 +357,7 @@ void loop() {
         final_u_roll = 0.5f * u_roll - 0.5f * u_yaw;    // 假设 rc.yaw_CMD 左打为正，左滚为负，则用减号
 
         // --- 协同逻辑 B: 横滚带俯仰 (自动抬头) : 只要有横滚角（无论左倾右倾），就给俯仰输出加一个“抬头”量
-        float pitch_comp = (1.0f - cosf(yaw_target)) * 80.0f;
+        float pitch_comp = (1.0f - cosf(current_roll)) * 80.0f;
         final_u_pitch = u_pitch - pitch_comp; // 减法代表抬头.
     }
 
